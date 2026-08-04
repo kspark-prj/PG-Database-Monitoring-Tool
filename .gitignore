@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.spec
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Compiled Rust extension (.pyd / .so)
+*.pyd
+*.so
+
+# Maturin wheels
+large_file_core/target/wheels/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+env/

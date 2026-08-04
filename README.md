@@ -68,10 +68,12 @@ GRANT pg_monitor TO [모니터링계정명];
 
 ## 🗂️ 프로젝트 트리 구조
 
-```text
+```textㅔㅛ쇄ㅜ
 PG_Monitor/
 ├── PG_monitor.py      # 메인 실행 파일
 ├── pg_config.json     # (자동생성) 접속 설정 캐시
 └── README.md          # 프로젝트 가이드
 
 ```
+
+pyinstaller -w -F --icon=main.ico --exclude-module Pillow PG_monitor.py
