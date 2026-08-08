@@ -15,7 +15,6 @@ import matplotlib
 
 matplotlib.use("TkAgg")
 
-import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import psycopg2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -406,13 +405,15 @@ class PostgresDashboard(ctk.CTk):
         self.lock_tree_window = None
 
         self.refresh_interval = 0
-        self.anim = None
+        self.timer_id = None  # FuncAnimation 대신 사용할 Pure Tkinter 타이머 ID
 
         self.metrics_queue = queue.Queue()
         self.is_fetching = False
 
         self.disk_fetch_counter = 0
         self.cached_db_size = "Unknown"
+        self.cached_max_conns = 100
+        self.cached_log_path = "Disabled"
 
         # 백그라운드 작업의 시작 시간을 기억하기 위한 메모리 딕셔너리
         self.job_start_times = {}
@@ -431,7 +432,6 @@ class PostgresDashboard(ctk.CTk):
         self.setup_charts()
         self.setup_theme_treeview()
         self.load_saved_config()
-        self.start_monitoring()
 
         self.check_queue_loop()
 
@@ -574,7 +574,6 @@ class PostgresDashboard(ctk.CTk):
         progress_scroll = ctk.CTkScrollbar(self.progress_container)
         progress_scroll.pack(side="right", fill="y")
 
-        # 💡 [변경] 예상 남은 시간 컬럼(remaining_minutes) 제거
         progress_cols = (
             "pid",
             "job_type",
@@ -598,7 +597,6 @@ class PostgresDashboard(ctk.CTk):
         self.progress_tree.heading("progress_percent", text="진행률 (%)", anchor="center")
         self.progress_tree.heading("elapsed_minutes", text="경과 시간", anchor="center")
 
-        # 💡 [변경] 잔여 너비를 고려하여 가로 폭 최적 배분
         self.progress_tree.column("pid", width=90, anchor="center")
         self.progress_tree.column("job_type", width=180, anchor="center")
         self.progress_tree.column("phase", width=450, anchor="w")
@@ -802,21 +800,43 @@ class PostgresDashboard(ctk.CTk):
                 )
                 self.conn.autocommit = True
 
-                with self.conn.cursor() as timeout_cur:
-                    timeout_cur.execute("SET statement_timeout = 2000;")
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SET statement_timeout = 2000;")
+
+                    # [최적화] 연결 직후 정적 값 1회 캐싱 (매 주기마다 쿼리 날리는 오버헤드 제거)
+                    cur.execute("SHOW max_connections;")
+                    res_max = cur.fetchone()
+                    self.cached_max_conns = int(res_max["max_connections"]) if res_max else 100
+
+                    try:
+                        cur.execute("SELECT pg_current_logfile() AS current_log;")
+                        log_res = cur.fetchone()
+                        self.cached_log_path = (
+                            log_res["current_log"]
+                            if log_res and log_res.get("current_log")
+                            else "Disabled"
+                        )
+                    except Exception:
+                        self.cached_log_path = "Disabled"
 
                 self.is_connected = True
                 self.lbl_status.configure(text="Connected", text_color="#2CA02C")
                 self.btn_connect.configure(text="연결 해제 (Disconnect)", fg_color="#D62728")
                 if self.var_save_info.get():
                     self.save_config()
+
                 self.manual_refresh_dashboard()
+                self.schedule_next_refresh()
             except Exception as e:
                 messagebox.showerror("접속 오류", f"데이터베이스 연결에 실패했습니다: {e}")
         else:
             self.disconnect_db()
 
     def disconnect_db(self):
+        if self.timer_id is not None:
+            self.after_cancel(self.timer_id)
+            self.timer_id = None
+
         if self.conn:
             try:
                 self.conn.close()
@@ -982,9 +1002,9 @@ class PostgresDashboard(ctk.CTk):
                         0.0,
                     )
 
-                cur.execute("SHOW max_connections;")
-                res_max = cur.fetchone()
-                data["max_conns"] = int(res_max["max_connections"]) if res_max else 100
+                # [최적화] 캐싱된 max_connections 및 sys_log_path 사용
+                data["max_conns"] = self.cached_max_conns
+                data["sys_log_path"] = self.cached_log_path
 
                 cur.execute("SELECT pg_current_wal_lsn();")
                 res_wal = cur.fetchone()
@@ -1067,17 +1087,6 @@ class PostgresDashboard(ctk.CTk):
                 """)
                 data["progress_jobs"] = cur.fetchall() or []
 
-                log_path = None
-                try:
-                    cur.execute("SELECT pg_current_logfile() AS current_log;")
-                    log_res = cur.fetchone()
-                    if log_res and log_res.get("current_log"):
-                        log_path = log_res["current_log"]
-                except Exception:
-                    pass
-
-                data["sys_log_path"] = log_path if log_path else "Disabled"
-
         except Exception:
             try:
                 self.conn.rollback()
@@ -1085,10 +1094,6 @@ class PostgresDashboard(ctk.CTk):
                 pass
             return None
         return data
-
-    def update_dashboard(self, frame):
-        if self.refresh_interval > 0:
-            self.force_refresh_dashboard()
 
     def render_dashboard_ui(self, data):
         curr_time = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1135,7 +1140,7 @@ class PostgresDashboard(ctk.CTk):
             colors=["#2CA02C", "#D62728", "#FF7F0E"],
         )
 
-        import matplotlib.ticker as ticker
+        from matplotlib import ticker
 
         self.ax_ash.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
@@ -1199,7 +1204,6 @@ class PostgresDashboard(ctk.CTk):
             blocks_total = job.get("blocks_total") or 0
             phase = job["phase"] if job["phase"] else "-"
 
-            # 진행률 문자열 보정 (100% 이후 유실 구간 대응)
             if blocks_total > 0:
                 pct = round(100.0 * blocks_done / blocks_total, 2)
                 if pct >= 100.0:
@@ -1222,7 +1226,6 @@ class PostgresDashboard(ctk.CTk):
             elapsed_td = now - self.job_start_times[pid]
             elapsed_str = str(datetime.timedelta(seconds=int(elapsed_td.total_seconds())))
 
-            # 💡 [변경] 불필요한 실시간 남은 시간(remaining_minutes) 연산 알고리즘 완전 삭제
             self.progress_tree.insert(
                 "",
                 "end",
@@ -1262,7 +1265,9 @@ class PostgresDashboard(ctk.CTk):
                     q_clean,
                 ),
             )
-        self.canvas.draw()
+
+        # [최적화] draw() 대신 draw_idle() 호출로 UI 스레드 버벅임 원천 방지
+        self.canvas.draw_idle()
 
     def setup_theme_treeview(self):
         s = ttk.Style()
@@ -1291,11 +1296,9 @@ class PostgresDashboard(ctk.CTk):
         s.map("Treeview.Heading", background=[("active", "#383838")])
 
     def change_trigger_interval(self, value):
-        if self.anim and hasattr(self.anim, "event_source") and self.anim.event_source:
-            try:
-                self.anim.event_source.stop()
-            except Exception:
-                pass
+        if self.timer_id is not None:
+            self.after_cancel(self.timer_id)
+            self.timer_id = None
 
         if value == "수동":
             self.refresh_interval = 0
@@ -1303,28 +1306,20 @@ class PostgresDashboard(ctk.CTk):
         else:
             self.refresh_interval = int(value.replace("초", "")) * 1000
             self.manual_refresh_dashboard()
-            self.anim = animation.FuncAnimation(
-                self.fig,
-                self.update_dashboard,
-                interval=self.refresh_interval,
-                cache_frame_data=False,
-            )
-            if self.anim.event_source:
-                self.anim.event_source.start()
+            self.schedule_next_refresh()
 
-    def start_monitoring(self):
-        if self.refresh_interval > 0:
-            self.anim = animation.FuncAnimation(
-                self.fig,
-                self.update_dashboard,
-                interval=self.refresh_interval,
-                cache_frame_data=False,
-            )
+    def schedule_next_refresh(self):
+        if self.timer_id is not None:
+            self.after_cancel(self.timer_id)
+            self.timer_id = None
+
+        if self.is_connected and self.refresh_interval > 0:
+            self.force_refresh_dashboard()
+            self.timer_id = self.after(self.refresh_interval, self.schedule_next_refresh)
 
     def on_exit(self):
-        if self.anim and hasattr(self.anim, "event_source"):
-            if self.anim.event_source is not None:
-                self.anim.event_source.stop()
+        if self.timer_id is not None:
+            self.after_cancel(self.timer_id)
 
         self.disconnect_db()
         plt.close("all")
