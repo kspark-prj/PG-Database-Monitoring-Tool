@@ -10,18 +10,14 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
-
-# matplotlib DPI 및 GUI 쓰레드 충돌 방지 설정
-import matplotlib
-from PIL import Image
-
-matplotlib.use("TkAgg")
-
 import psycopg2
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from matplotlib.ticker import MaxNLocator
 from psycopg2.extras import RealDictCursor
+
+# Matplotlib 및 PIL 글로벌 변수 선언 (백그라운드에서 지연 로딩됨)
+FigureCanvasTkAgg = None
+Figure = None
+MaxNLocator = None
+Image = None
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -54,7 +50,13 @@ class SplashScreen(ctk.CTkToplevel):
         # 스플래시 창 원하는 크기 지정 (가로 600px, 세로 350px)
         target_w, target_h = 600, 350
 
-        # 이미지 로드
+        # 지연 로딩된 Image 사용
+        global Image
+        if Image is None:
+            from PIL import Image as PILImage
+
+            Image = PILImage
+
         img_full_path = resource_path(image_path)
         if os.path.exists(img_full_path):
             pil_img = Image.open(img_full_path)
@@ -77,7 +79,7 @@ class SplashScreen(ctk.CTkToplevel):
         self.container = ctk.CTkFrame(self, corner_radius=0, fg_color="#0d1b2a")
         self.container.pack(fill="both", expand=True)
 
-        # 하단 프로그레스바 및 상태 레이아웃 (side="bottom" 고정)
+        # 하단 프로그레스바 및 상태 레이아웃
         self.bottom_frame = ctk.CTkFrame(
             self.container, fg_color="#0b1320", height=45, corner_radius=0
         )
@@ -85,7 +87,7 @@ class SplashScreen(ctk.CTkToplevel):
 
         self.lbl_status = ctk.CTkLabel(
             self.bottom_frame,
-            text="Database initialize: 0%",
+            text="Initializing application...",
             font=ctk.CTkFont(size=11),
             text_color="#00d2ff",
         )
@@ -102,7 +104,7 @@ class SplashScreen(ctk.CTkToplevel):
         self.progress_bar.pack(pady=(0, 6))
         self.progress_bar.set(0.0)
 
-        # 배경 이미지 레이블 (남은 공간을 채우도록 나중에 배치)
+        # 배경 이미지 레이블
         if self.bg_image:
             self.lbl_bg = ctk.CTkLabel(self.container, image=self.bg_image, text="")
             self.lbl_bg.pack(fill="both", expand=True)
@@ -489,8 +491,9 @@ class PostgresDashboard(ctk.CTk):
         self.geometry("1450x940")
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
 
-        # 스플래시 창 생성
+        # 1) 스플래시 창 즉시 노출 및 강제 렌더링
         self.splash = SplashScreen(self, image_path="splash.png")
+        self.splash.update()
 
         self.conn = None
         self.is_connected = False
@@ -518,34 +521,59 @@ class PostgresDashboard(ctk.CTk):
         self.ash_io = [0] * self.max_points
         self.ash_idle = [0] * self.max_points
 
-        # 비동기 로딩 스레드 가동
+        # 2) 비동기 로딩 스레드 가동
         threading.Thread(target=self.init_app_async, daemon=True).start()
 
+    def update_splash_progress(self, progress, text):
+        self.after(0, lambda: self.splash.update_progress(progress, text))
+
     def init_app_async(self):
-        """백그라운드에서 메인 UI 컴포넌트 및 설정을 초기화하며 스플래시 프로그레스바 갱신"""
+        """백그라운드에서 지연 로딩 후, 메인 쓰레드 UI 작업을 동기화하여 순차 처리"""
+        # Step 1: Matplotlib Heavy Import 백그라운드 지연 로딩
+        self.update_splash_progress(0.15, "Importing rendering engine...")
+        global FigureCanvasTkAgg, Figure, MaxNLocator
+        import matplotlib
+
+        matplotlib.use("TkAgg")
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg as FCTkAgg
+        from matplotlib.figure import Figure as Fig
+        from matplotlib.ticker import MaxNLocator as MNL
+
+        FigureCanvasTkAgg = FCTkAgg
+        Figure = Fig
+        MaxNLocator = MNL
+
+        # Step 2: 메인 GUI 컴포넌트 순차 생성 (스레드 세이프 동기화)
         steps = [
-            ("Database initialize: 15%", self.create_db_conn_panel),
-            ("Database initialize: 40%", self.create_main_layout),
-            ("Database initialize: 65%", self.setup_charts),
-            ("Database initialize: 85%", self.setup_theme_treeview),
-            ("Database initialize: 95%", self.load_saved_config),
+            (0.35, "Database initialize: Panel", self.create_db_conn_panel),
+            (0.55, "Database initialize: Layout", self.create_main_layout),
+            (0.75, "Database initialize: Charts", self.setup_charts),
+            (0.88, "Database initialize: Theme", self.setup_theme_treeview),
+            (0.95, "Database initialize: Config", self.load_saved_config),
         ]
 
-        total_steps = len(steps)
-        for idx, (msg, func) in enumerate(steps, start=1):
-            progress = idx / total_steps
-            self.after(0, self.splash.update_progress, progress, msg)
-            func()
-            time.sleep(0.2)
+        for progress, msg, func in steps:
+            self.update_splash_progress(progress, msg)
 
-        self.after(0, self.check_queue_loop)
-        self.after(0, self.finish_loading)
+            done_event = threading.Event()
+
+            def run_gui_task():
+                func()
+                self.splash.update_idletasks()
+                done_event.set()
+
+            self.after(0, run_gui_task)
+            done_event.wait()
+            time.sleep(0.08)
+
+        self.update_splash_progress(1.0, "Database initialize: 100%")
+        self.after(100, self.check_queue_loop)
+        self.after(200, self.finish_loading)
 
     def finish_loading(self):
         """로딩 완료 후 스플래시 종료 및 메인 윈도우 오픈"""
-        self.splash.update_progress(1.0, "Database initialize: 100%")
-        self.after(300, self.splash.destroy)
-        self.after(350, self.deiconify)
+        self.splash.destroy()
+        self.deiconify()
 
     def create_db_conn_panel(self):
         self.conn_frame = ctk.CTkFrame(self, height=60)
@@ -873,6 +901,7 @@ class PostgresDashboard(ctk.CTk):
         return lbl
 
     def setup_charts(self):
+        global Figure, FigureCanvasTkAgg
         self.fig = Figure(figsize=(10, 2.2), facecolor="#2b2b2b")
 
         self.ax_ash = self.fig.add_subplot(111)
@@ -1200,6 +1229,7 @@ class PostgresDashboard(ctk.CTk):
         return data
 
     def render_dashboard_ui(self, data):
+        global MaxNLocator
         curr_time = datetime.datetime.now().strftime("%H:%M:%S")
         self.time_data.pop(0)
         self.time_data.append(curr_time)
@@ -1244,7 +1274,8 @@ class PostgresDashboard(ctk.CTk):
             colors=["#2CA02C", "#D62728", "#FF7F0E"],
         )
 
-        self.ax_ash.yaxis.set_major_locator(MaxNLocator(integer=True))
+        if MaxNLocator:
+            self.ax_ash.yaxis.set_major_locator(MaxNLocator(integer=True))
 
         current_max = max(self.ash_cpu) + max(self.ash_lock) + max(self.ash_io)
         self.ax_ash.set_ylim(bottom=0)
