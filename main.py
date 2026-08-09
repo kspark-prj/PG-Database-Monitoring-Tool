@@ -5,19 +5,22 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
-# matplotlib DPI 충돌 원천 차단
+# matplotlib DPI 및 GUI 쓰레드 충돌 방지 설정
 import matplotlib
+from PIL import Image
 
 matplotlib.use("TkAgg")
 
-import matplotlib.pyplot as plt
 import psycopg2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 from psycopg2.extras import RealDictCursor
 
 ctk.set_appearance_mode("Dark")
@@ -26,6 +29,89 @@ CONFIG_FILE = "pg_config.json"
 
 # 대시보드 커넥션 식별을 위한 고유 상수 정의
 MONITORING_APP_NAME = "MY_MONITORING_DASHBOARD"
+
+
+def resource_path(relative_path):
+    """PyInstaller 번들 내 리소스 파일의 절대 경로를 반환합니다."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+class SplashScreen(ctk.CTkToplevel):
+    """프로그레스바가 내장된 스플래시 윈도우"""
+
+    def __init__(self, parent, image_path="splash.png"):
+        super().__init__(parent)
+        self.parent = parent
+
+        # 창 타이틀바 제거 및 최상단 표시
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+
+        # 스플래시 창 원하는 크기 지정 (가로 600px, 세로 350px)
+        target_w, target_h = 600, 350
+
+        # 이미지 로드
+        img_full_path = resource_path(image_path)
+        if os.path.exists(img_full_path):
+            pil_img = Image.open(img_full_path)
+            self.bg_image = ctk.CTkImage(
+                light_image=pil_img, dark_image=pil_img, size=(target_w, target_h)
+            )
+        else:
+            self.bg_image = None
+
+        img_w, img_h = target_w, target_h
+
+        # 화면 중앙 정렬
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = (screen_w - img_w) // 2
+        y = (screen_h - img_h) // 2
+        self.geometry(f"{img_w}x{img_h}+{x}+{y}")
+
+        # 메인 컨테이너
+        self.container = ctk.CTkFrame(self, corner_radius=0, fg_color="#0d1b2a")
+        self.container.pack(fill="both", expand=True)
+
+        # 하단 프로그레스바 및 상태 레이아웃 (side="bottom" 고정)
+        self.bottom_frame = ctk.CTkFrame(
+            self.container, fg_color="#0b1320", height=45, corner_radius=0
+        )
+        self.bottom_frame.pack(side="bottom", fill="x")
+
+        self.lbl_status = ctk.CTkLabel(
+            self.bottom_frame,
+            text="Database initialize: 0%",
+            font=ctk.CTkFont(size=11),
+            text_color="#00d2ff",
+        )
+        self.lbl_status.pack(pady=(4, 2))
+
+        self.progress_bar = ctk.CTkProgressBar(
+            self.bottom_frame,
+            width=img_w - 60,
+            height=6,
+            corner_radius=3,
+            progress_color="#00d2ff",
+            fg_color="#1b2a4a",
+        )
+        self.progress_bar.pack(pady=(0, 6))
+        self.progress_bar.set(0.0)
+
+        # 배경 이미지 레이블 (남은 공간을 채우도록 나중에 배치)
+        if self.bg_image:
+            self.lbl_bg = ctk.CTkLabel(self.container, image=self.bg_image, text="")
+            self.lbl_bg.pack(fill="both", expand=True)
+
+    def update_progress(self, value, text):
+        """진행률(0.0 ~ 1.0) 및 안내 문구 업데이트"""
+        self.progress_bar.set(value)
+        self.lbl_status.configure(text=text)
+        self.update_idletasks()
 
 
 class SessionActionPopup(ctk.CTkToplevel):
@@ -396,16 +482,22 @@ class LockTreePopup(ctk.CTkToplevel):
 class PostgresDashboard(ctk.CTk):
     def __init__(self):
         super().__init__()
+        # 초기 구성이 끝나기 전까지 메인 창 숨김
+        self.withdraw()
+
         self.title("🐘 PostgreSQL Advanced Tuning Dashboard (Prod Emergency Fix)")
         self.geometry("1450x940")
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
+
+        # 스플래시 창 생성
+        self.splash = SplashScreen(self, image_path="splash.png")
 
         self.conn = None
         self.is_connected = False
         self.lock_tree_window = None
 
         self.refresh_interval = 0
-        self.timer_id = None  # FuncAnimation 대신 사용할 Pure Tkinter 타이머 ID
+        self.timer_id = None
 
         self.metrics_queue = queue.Queue()
         self.is_fetching = False
@@ -415,7 +507,6 @@ class PostgresDashboard(ctk.CTk):
         self.cached_max_conns = 100
         self.cached_log_path = "Disabled"
 
-        # 백그라운드 작업의 시작 시간을 기억하기 위한 메모리 딕셔너리
         self.job_start_times = {}
 
         self.max_points = 20
@@ -427,13 +518,34 @@ class PostgresDashboard(ctk.CTk):
         self.ash_io = [0] * self.max_points
         self.ash_idle = [0] * self.max_points
 
-        self.create_db_conn_panel()
-        self.create_main_layout()
-        self.setup_charts()
-        self.setup_theme_treeview()
-        self.load_saved_config()
+        # 비동기 로딩 스레드 가동
+        threading.Thread(target=self.init_app_async, daemon=True).start()
 
-        self.check_queue_loop()
+    def init_app_async(self):
+        """백그라운드에서 메인 UI 컴포넌트 및 설정을 초기화하며 스플래시 프로그레스바 갱신"""
+        steps = [
+            ("Database initialize: 15%", self.create_db_conn_panel),
+            ("Database initialize: 40%", self.create_main_layout),
+            ("Database initialize: 65%", self.setup_charts),
+            ("Database initialize: 85%", self.setup_theme_treeview),
+            ("Database initialize: 95%", self.load_saved_config),
+        ]
+
+        total_steps = len(steps)
+        for idx, (msg, func) in enumerate(steps, start=1):
+            progress = idx / total_steps
+            self.after(0, self.splash.update_progress, progress, msg)
+            func()
+            time.sleep(0.2)
+
+        self.after(0, self.check_queue_loop)
+        self.after(0, self.finish_loading)
+
+    def finish_loading(self):
+        """로딩 완료 후 스플래시 종료 및 메인 윈도우 오픈"""
+        self.splash.update_progress(1.0, "Database initialize: 100%")
+        self.after(300, self.splash.destroy)
+        self.after(350, self.deiconify)
 
     def create_db_conn_panel(self):
         self.conn_frame = ctk.CTkFrame(self, height=60)
@@ -761,13 +873,7 @@ class PostgresDashboard(ctk.CTk):
         return lbl
 
     def setup_charts(self):
-        plt.rcParams["text.color"] = "white"
-        plt.rcParams["axes.labelcolor"] = "white"
-        plt.rcParams["xtick.color"] = "white"
-        plt.rcParams["ytick.color"] = "white"
-
-        self.fig = plt.figure(figsize=(10, 2.2))
-        self.fig.set_facecolor("#2b2b2b")
+        self.fig = Figure(figsize=(10, 2.2), facecolor="#2b2b2b")
 
         self.ax_ash = self.fig.add_subplot(111)
         self.ax_ash.set_title(
@@ -779,8 +885,8 @@ class PostgresDashboard(ctk.CTk):
 
         self.ax_ash.set_facecolor("#202020")
         self.ax_ash.grid(True, color="#333333", linestyle="--", linewidth=0.5)
-        self.ax_ash.tick_params(axis="x", rotation=5, labelsize=7)
-        self.ax_ash.tick_params(axis="y", labelsize=8)
+        self.ax_ash.tick_params(axis="x", colors="white", rotation=5, labelsize=7)
+        self.ax_ash.tick_params(axis="y", colors="white", labelsize=8)
 
         self.fig.tight_layout()
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_frame)
@@ -803,7 +909,6 @@ class PostgresDashboard(ctk.CTk):
                 with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("SET statement_timeout = 2000;")
 
-                    # [최적화] 연결 직후 정적 값 1회 캐싱 (매 주기마다 쿼리 날리는 오버헤드 제거)
                     cur.execute("SHOW max_connections;")
                     res_max = cur.fetchone()
                     self.cached_max_conns = int(res_max["max_connections"]) if res_max else 100
@@ -1002,7 +1107,6 @@ class PostgresDashboard(ctk.CTk):
                         0.0,
                     )
 
-                # [최적화] 캐싱된 max_connections 및 sys_log_path 사용
                 data["max_conns"] = self.cached_max_conns
                 data["sys_log_path"] = self.cached_log_path
 
@@ -1131,7 +1235,7 @@ class PostgresDashboard(ctk.CTk):
 
         self.ax_ash.set_ylabel("Active Sessions", color="white", fontsize=8)
 
-        stacks = self.ax_ash.stackplot(
+        self.ax_ash.stackplot(
             list(range(self.max_points)),
             self.ash_cpu,
             self.ash_lock,
@@ -1140,9 +1244,7 @@ class PostgresDashboard(ctk.CTk):
             colors=["#2CA02C", "#D62728", "#FF7F0E"],
         )
 
-        from matplotlib import ticker
-
-        self.ax_ash.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+        self.ax_ash.yaxis.set_major_locator(MaxNLocator(integer=True))
 
         current_max = max(self.ash_cpu) + max(self.ash_lock) + max(self.ash_io)
         self.ax_ash.set_ylim(bottom=0)
@@ -1150,13 +1252,15 @@ class PostgresDashboard(ctk.CTk):
             self.ax_ash.set_ylim(top=1)
 
         self.ax_ash.set_xticks(t_idx)
-        self.ax_ash.set_xticklabels(t_lbl)
+        self.ax_ash.set_xticklabels(t_lbl, color="white")
+        self.ax_ash.tick_params(axis="y", colors="white")
         self.ax_ash.legend(
             facecolor="#202020",
             edgecolor="none",
             loc="upper left",
             fontsize="x-small",
             framealpha=0.6,
+            labelcolor="white",
         )
 
         status_str = data.get("disk_status", "Safe-Fetched")
@@ -1266,7 +1370,6 @@ class PostgresDashboard(ctk.CTk):
                 ),
             )
 
-        # [최적화] draw() 대신 draw_idle() 호출로 UI 스레드 버벅임 원천 방지
         self.canvas.draw_idle()
 
     def setup_theme_treeview(self):
@@ -1322,7 +1425,10 @@ class PostgresDashboard(ctk.CTk):
             self.after_cancel(self.timer_id)
 
         self.disconnect_db()
-        plt.close("all")
+
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.get_tk_widget().destroy()
+
         self.quit()
         self.destroy()
         os._exit(0)

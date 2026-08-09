@@ -78,4 +78,4 @@ PG_Monitor/
 
 ## 윈도우 파일 빌드 최적화
 
-pyinstaller -w -D --noupx --clean --icon=main.ico --exclude-module Pillow --exclude-module tkinter.test --exclude-module matplotlib.tests --exclude-module matplotlib.testing --exclude-module matplotlib.backends.backend_pdf --exclude-module matplotlib.backends.backend_svg --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 --exclude-module PySide6 --exclude-module scipy --exclude-module pandas --exclude-module IPython --exclude-module notebook --exclude-module tornado PG_monitor.py
+pyinstaller -w -D --noupx --clean --icon=main.ico --add-data "splash.png;." --exclude-module Pillow --exclude-module tkinter.test --exclude-module matplotlib.tests --exclude-module matplotlib.testing --exclude-module matplotlib.backends.backend_pdf --exclude-module matplotlib.backends.backend_svg --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 --exclude-module PySide6 --exclude-module scipy --exclude-module pandas --exclude-module IPython --exclude-module notebook --exclude-module tornado main.py
