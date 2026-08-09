@@ -13,6 +13,12 @@ import customtkinter as ctk
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# PyInstaller 네이티브 스플래시 연동용 처리
+try:
+    import pyi_splash
+except ImportError:
+    pyi_splash = None
+
 # Matplotlib 및 PIL 글로벌 변수 선언 (백그라운드에서 지연 로딩됨)
 FigureCanvasTkAgg = None
 Figure = None
@@ -37,7 +43,7 @@ def resource_path(relative_path):
 
 
 class SplashScreen(ctk.CTkToplevel):
-    """프로그레스바가 내장된 스플래시 윈도우"""
+    """프로그레스바가 내장된 개선된 스플래시 윈도우"""
 
     def __init__(self, parent, image_path="splash.png"):
         super().__init__(parent)
@@ -47,8 +53,11 @@ class SplashScreen(ctk.CTkToplevel):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
 
-        # 스플래시 창 원하는 크기 지정 (가로 600px, 세로 350px)
-        target_w, target_h = 600, 350
+        # 1. 이미지 및 레이아웃 크기 정의 (이미지 비율 유지 + 하단 독립바 높이)
+        img_w, img_h = 600, 350
+        bottom_h = 60
+        total_w = img_w
+        total_h = img_h + bottom_h
 
         # 지연 로딩된 Image 사용
         global Image
@@ -61,29 +70,38 @@ class SplashScreen(ctk.CTkToplevel):
         if os.path.exists(img_full_path):
             pil_img = Image.open(img_full_path)
             self.bg_image = ctk.CTkImage(
-                light_image=pil_img, dark_image=pil_img, size=(target_w, target_h)
+                light_image=pil_img, dark_image=pil_img, size=(img_w, img_h)
             )
         else:
             self.bg_image = None
 
-        img_w, img_h = target_w, target_h
-
-        # 화면 중앙 정렬
+        # 화면 중앙 정렬 (전체 창 600x410 기준)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        x = (screen_w - img_w) // 2
-        y = (screen_h - img_h) // 2
-        self.geometry(f"{img_w}x{img_h}+{x}+{y}")
+        x = (screen_w - total_w) // 2
+        y = (screen_h - total_h) // 2
+        self.geometry(f"{total_w}x{total_h}+{x}+{y}")
 
         # 메인 컨테이너
-        self.container = ctk.CTkFrame(self, corner_radius=0, fg_color="#0d1b2a")
+        self.container = ctk.CTkFrame(self, corner_radius=0, fg_color="#18191A")
         self.container.pack(fill="both", expand=True)
 
-        # 하단 프로그레스바 및 상태 레이아웃
+        # 상단: 원본 비율 보존 이미지 영역
+        self.top_frame = ctk.CTkFrame(
+            self.container, corner_radius=0, fg_color="transparent", height=img_h
+        )
+        self.top_frame.pack(side="top", fill="x")
+
+        if self.bg_image:
+            self.lbl_bg = ctk.CTkLabel(self.top_frame, image=self.bg_image, text="")
+            self.lbl_bg.pack(fill="both", expand=True)
+
+        # 하단: 독립된 프로그레스바 및 상태 프레임 (#18191A)
         self.bottom_frame = ctk.CTkFrame(
-            self.container, fg_color="#0b1320", height=45, corner_radius=0
+            self.container, fg_color="#18191A", height=bottom_h, corner_radius=0
         )
         self.bottom_frame.pack(side="bottom", fill="x")
+        self.bottom_frame.pack_propagate(False)  # 고정 높이 유지
 
         self.lbl_status = ctk.CTkLabel(
             self.bottom_frame,
@@ -91,7 +109,7 @@ class SplashScreen(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11),
             text_color="#00d2ff",
         )
-        self.lbl_status.pack(pady=(4, 2))
+        self.lbl_status.pack(pady=(8, 2))
 
         self.progress_bar = ctk.CTkProgressBar(
             self.bottom_frame,
@@ -101,13 +119,8 @@ class SplashScreen(ctk.CTkToplevel):
             progress_color="#00d2ff",
             fg_color="#1b2a4a",
         )
-        self.progress_bar.pack(pady=(0, 6))
+        self.progress_bar.pack(pady=(0, 8))
         self.progress_bar.set(0.0)
-
-        # 배경 이미지 레이블
-        if self.bg_image:
-            self.lbl_bg = ctk.CTkLabel(self.container, image=self.bg_image, text="")
-            self.lbl_bg.pack(fill="both", expand=True)
 
     def update_progress(self, value, text):
         """진행률(0.0 ~ 1.0) 및 안내 문구 업데이트"""
@@ -484,16 +497,24 @@ class LockTreePopup(ctk.CTkToplevel):
 class PostgresDashboard(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # 초기 구성이 끝나기 전까지 메인 창 숨김
+        # 1) 메인 창 숨김 (Double Buffering 1단계)
         self.withdraw()
 
         self.title("🐘 PostgreSQL Advanced Tuning Dashboard (Prod Emergency Fix)")
         self.geometry("1450x940")
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
 
-        # 1) 스플래시 창 즉시 노출 및 강제 렌더링
+        # 2) CustomTkinter 스플래시 창 노출 및 강제 렌더링
         self.splash = SplashScreen(self, image_path="splash.png")
+        self.splash.update_idletasks()
         self.splash.update()
+
+        # 3) 스플래시가 화면에 그려진 직후 PyInstaller 네이티브 스플래시 닫기
+        if pyi_splash and pyi_splash.is_alive():
+            try:
+                pyi_splash.close()
+            except Exception:
+                pass
 
         self.conn = None
         self.is_connected = False
@@ -521,7 +542,7 @@ class PostgresDashboard(ctk.CTk):
         self.ash_io = [0] * self.max_points
         self.ash_idle = [0] * self.max_points
 
-        # 2) 비동기 로딩 스레드 가동
+        # 비동기 로딩 스레드 가동
         threading.Thread(target=self.init_app_async, daemon=True).start()
 
     def update_splash_progress(self, progress, text):
@@ -543,7 +564,7 @@ class PostgresDashboard(ctk.CTk):
         Figure = Fig
         MaxNLocator = MNL
 
-        # Step 2: 메인 GUI 컴포넌트 순차 생성 (스레드 세이프 동기화)
+        # Step 2: 메인 GUI 컴포넌트 순차 생성
         steps = [
             (0.35, "Database initialize: Panel", self.create_db_conn_panel),
             (0.55, "Database initialize: Layout", self.create_main_layout),
@@ -559,7 +580,8 @@ class PostgresDashboard(ctk.CTk):
 
             def run_gui_task():
                 func()
-                self.splash.update_idletasks()
+                if self.splash and self.splash.winfo_exists():
+                    self.splash.update_idletasks()
                 done_event.set()
 
             self.after(0, run_gui_task)
@@ -571,9 +593,21 @@ class PostgresDashboard(ctk.CTk):
         self.after(200, self.finish_loading)
 
     def finish_loading(self):
-        """로딩 완료 후 스플래시 종료 및 메인 윈도우 오픈"""
-        self.splash.destroy()
+        """로딩 완료 시 (Double Buffering 2단계) 메인 창 표시 후 스플래시 안전 파기"""
+        # 1. 메인 창 화면 표시
         self.deiconify()
+
+        # 2. 메인 UI 렌더링을 OS 수준에서 강제 완료
+        self.update_idletasks()
+        self.update()
+
+        # 3. 메인 창이 완전히 뒤에 그려진 직후 CustomTkinter 스플래시 파기 (Zero-Flicker)
+        if hasattr(self, "splash") and self.splash is not None:
+            self.splash.destroy()
+            self.splash = None
+
+        # 4. 메인 창 포커스 선점
+        self.focus_force()
 
     def create_db_conn_panel(self):
         self.conn_frame = ctk.CTkFrame(self, height=60)
