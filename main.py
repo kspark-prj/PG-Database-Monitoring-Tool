@@ -421,26 +421,47 @@ class LockTreePopup(ctk.CTkToplevel):
             self.after(600, lambda: self.load_tree(self.conn))
 
     def load_tree(self, conn):
+        """pg_blocking_pids() 기반 계층형 락 트리 생성 로직으로 보완 현해화"""
         if conn is None:
             return
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    WITH RECURSIVE lock_tree AS (
-                        SELECT w.pid AS waiting_pid, b.pid AS blocking_pid, 1 AS level, ARRAY[w.pid] AS path
-                        FROM pg_catalog.pg_locks w
-                        JOIN pg_catalog.pg_locks b ON b.granted AND NOT w.granted AND b.locktype = w.locktype AND b.pid != w.pid
+                    WITH RECURSIVE lock_graph AS (
+                        -- Root Blockers (다른 세션을 블락하고 있으나, 본인은 블락당하지 않은 세션)
+                        SELECT
+                            a.pid AS waiting_pid,
+                            NULL::integer AS blocking_pid,
+                            1 AS level,
+                            ARRAY[a.pid] AS path
+                        FROM pg_stat_activity a
+                        WHERE a.pid IN (
+                            SELECT unnest(pg_blocking_pids(pid)) FROM pg_stat_activity
+                        )
+                        AND pg_blocking_pids(a.pid) = '{}'
+
                         UNION ALL
-                        SELECT w.pid, b.pid, lt.level + 1, lt.path || w.pid
-                        FROM pg_catalog.pg_locks w
-                        JOIN pg_catalog.pg_locks b ON b.granted AND NOT w.granted AND b.locktype = w.locktype
-                        JOIN lock_tree lt ON lt.waiting_pid = b.pid
-                        WHERE w.pid != b.pid AND NOT (w.pid = ANY(lt.path))
+
+                        -- Waiting Sessions (Root 또는 상위 Blocker에 대기 중인 세션)
+                        SELECT
+                            a.pid AS waiting_pid,
+                            (pg_blocking_pids(a.pid))[1] AS blocking_pid,
+                            lg.level + 1,
+                            lg.path || a.pid
+                        FROM pg_stat_activity a
+                        JOIN lock_graph lg ON lg.waiting_pid = (pg_blocking_pids(a.pid))[1]
+                        WHERE NOT (a.pid = ANY(lg.path)) -- 순환 참조 방지
                     )
-                    SELECT lt.waiting_pid, lt.blocking_pid, lt.level, a.usename, a.state, a.query
-                    FROM lock_tree lt
-                    JOIN pg_stat_activity a ON lt.waiting_pid = a.pid
-                    ORDER BY lt.path;
+                    SELECT
+                        lg.waiting_pid,
+                        lg.blocking_pid,
+                        lg.level,
+                        a.usename,
+                        a.state,
+                        a.query
+                    FROM lock_graph lg
+                    JOIN pg_stat_activity a ON lg.waiting_pid = a.pid
+                    ORDER BY lg.path;
                 """)
                 rows = cur.fetchall()
                 if not rows:
@@ -480,7 +501,13 @@ class LockTreePopup(ctk.CTkToplevel):
                         "end",
                         text=f"⚠ Waiting {pid}",
                         open=True,
-                        values=(pid, parent_pid, r["usename"], r["state"], q_clean),
+                        values=(
+                            pid,
+                            parent_pid if parent_pid else "ROOT",
+                            r["usename"],
+                            r["state"],
+                            q_clean,
+                        ),
                     )
                     inserted_nodes[pid] = node_id
         except Exception:
