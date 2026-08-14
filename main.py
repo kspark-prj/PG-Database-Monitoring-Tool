@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -33,6 +34,54 @@ CONFIG_FILE = "pg_config.json"
 
 # 대시보드 커넥션 식별을 위한 고유 상수 정의
 MONITORING_APP_NAME = "MY_MONITORING_DASHBOARD"
+
+# 중복 실행 방지 및 포커스 통신을 위한 고유 로컬 포트 정의
+SINGLE_INSTANCE_PORT = 63148
+
+
+def ensure_single_instance():
+    """
+    중복 실행을 방지하고, 이미 실행 중인 인스턴스가 있다면
+    포커스 요청 신호를 보낸 뒤 스플래시 창조차 띄우지 않고 프로세스를 종료합니다.
+    """
+    global single_instance_socket
+    single_instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # 포트 바인딩 시도 (첫 번째 실행)
+        single_instance_socket.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        single_instance_socket.listen(1)
+    except OSError:
+        # 바인딩 실패 = 이미 프로그램이 실행 중임
+        try:
+            # 기존 실행 중인 프로세스에 포커스 이동 신호 전송
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+            client_socket.sendall(b"FOCUS")
+            client_socket.close()
+        except Exception:
+            pass
+        # 스플래시 윈도우 생성 전 즉시 종료
+        sys.exit(0)
+
+
+def start_focus_listener(app):
+    """
+    기존 프로세스에서 백그라운드 스레드로 실행되어
+    후속 실행 요청이 들어오면 창을 최상단으로 올리고 포커스를 이동시킵니다.
+    """
+
+    def listen():
+        while True:
+            try:
+                conn, _ = single_instance_socket.accept()
+                data = conn.recv(1024)
+                if data == b"FOCUS":
+                    app.after(0, app.bring_to_focus)
+                conn.close()
+            except Exception:
+                break
+
+    threading.Thread(target=listen, daemon=True).start()
 
 
 def resource_path(relative_path):
@@ -71,24 +120,18 @@ class SplashScreen(ctk.CTkToplevel):
             Image = PILImage
             ImageTk = PILImageTk
 
-        self.canvas = ctk.CTkCanvas(
-            self, width=self.width, height=self.height, highlightthickness=0, bg="#18191A"
-        )
+        self.canvas = ctk.CTkCanvas(self, width=self.width, height=self.height, highlightthickness=0, bg="#18191A")
         self.canvas.pack(fill="both", expand=True)
 
         img_full_path = str(resource_path(image_path))
         if os.path.exists(img_full_path):
-            pil_img = Image.open(img_full_path).resize(
-                (self.width, self.height), Image.Resampling.LANCZOS
-            )
+            pil_img = Image.open(img_full_path).resize((self.width, self.height), Image.Resampling.LANCZOS)
             self.bg_photo = ImageTk.PhotoImage(pil_img)
             self.canvas.create_image(0, 0, image=self.bg_photo, anchor="nw")
         else:
             self.bg_photo = None
 
-        self.bottom_overlay = ctk.CTkFrame(
-            self.canvas, fg_color="#18191A", height=60, corner_radius=0
-        )
+        self.bottom_overlay = ctk.CTkFrame(self.canvas, fg_color="#18191A", height=60, corner_radius=0)
         self.bottom_overlay.pack_propagate(False)
 
         self.canvas.create_window(
@@ -154,13 +197,9 @@ class SessionActionPopup(ctk.CTkToplevel):
         q_frame.pack(fill="x", padx=15, pady=2)
         q_frame.pack_propagate(False)
 
-        self.txt_query = tk.Text(
-            q_frame, bg="#1e1e1e", fg="#ffffff", insertbackground="white", font=("Consolas", 10)
-        )
+        self.txt_query = tk.Text(q_frame, bg="#1e1e1e", fg="#ffffff", insertbackground="white", font=("Consolas", 10))
         self.txt_query.pack(side="left", fill="both", expand=True)
-        self.txt_query.insert(
-            tk.END, self.query_text if self.query_text else "실행 중인 쿼리가 없습니다."
-        )
+        self.txt_query.insert(tk.END, self.query_text if self.query_text else "실행 중인 쿼리가 없습니다.")
         self.txt_query.configure(state="disabled")
 
         q_scr = ctk.CTkScrollbar(q_frame, command=self.txt_query.yview)
@@ -208,9 +247,7 @@ class SessionActionPopup(ctk.CTkToplevel):
         plan_frame = ctk.CTkFrame(self)
         plan_frame.pack(fill="both", expand=True, padx=15, pady=(2, 15))
 
-        self.txt_plan = tk.Text(
-            plan_frame, bg="#202020", fg="#2CA02C", insertbackground="white", font=("Consolas", 10)
-        )
+        self.txt_plan = tk.Text(plan_frame, bg="#202020", fg="#2CA02C", insertbackground="white", font=("Consolas", 10))
         self.txt_plan.pack(side="left", fill="both", expand=True)
 
         plan_scr = ctk.CTkScrollbar(plan_frame, command=self.txt_plan.yview)
@@ -222,9 +259,7 @@ class SessionActionPopup(ctk.CTkToplevel):
         self.txt_plan.delete("1.0", tk.END)
 
         if self.conn is None or self.conn.closed:
-            self.txt_plan.insert(
-                tk.END, "데이터베이스 연결이 해제되었거나 세션이 동기화되지 않았습니다."
-            )
+            self.txt_plan.insert(tk.END, "데이터베이스 연결이 해제되었거나 세션이 동기화되지 않았습니다.")
             self.txt_plan.configure(state="disabled")
             return
 
@@ -276,12 +311,7 @@ class SessionActionPopup(ctk.CTkToplevel):
             self.txt_plan.configure(state="disabled")
             return
 
-        if (
-            q_upper.startswith("BACKGROUND")
-            or "PG_CATALOG." in q_upper
-            or "PG_TYPE" in q_upper
-            or "CURRENT_SCHEMAS" in q_upper
-        ):
+        if q_upper.startswith("BACKGROUND") or "PG_CATALOG." in q_upper or "PG_TYPE" in q_upper or "CURRENT_SCHEMAS" in q_upper:
             self.txt_plan.insert(
                 tk.END,
                 "💡 [안내] 내부 시스템 카탈로그 조회 쿼리이므로 실행 계획 분석 대상이 아닙니다.",
@@ -316,18 +346,14 @@ class SessionActionPopup(ctk.CTkToplevel):
                 self.conn.rollback()
             except Exception:
                 pass
-            self.txt_plan.insert(
-                tk.END, f"❌ 실행 계획 추출 실패.\n이유: {e}\n\nTarget SQL:\n{q_clean_check}"
-            )
+            self.txt_plan.insert(tk.END, f"❌ 실행 계획 추출 실패.\n이유: {e}\n\nTarget SQL:\n{q_clean_check}")
 
         self.txt_plan.configure(state="disabled")
 
     def kill_session(self):
         if not self.conn or self.conn.closed:
             return
-        if messagebox.askyesno(
-            "세션 강제 종료", f"PID {self.pid} 프로세스를 강제 종료하시겠습니까?"
-        ):
+        if messagebox.askyesno("세션 강제 종료", f"PID {self.pid} 프로세스를 강제 종료하시겠습니까?"):
             self.parent_dashboard.async_kill_session(self.pid)
             self.destroy()
 
@@ -360,9 +386,7 @@ class LockTreePopup(ctk.CTkToplevel):
         scroll.pack(side="right", fill="y")
 
         cols = ("pid", "blocked_by", "usename", "state", "query")
-        self.tree = ttk.Treeview(
-            frame, columns=cols, show="tree headings", yscrollcommand=scroll.set
-        )
+        self.tree = ttk.Treeview(frame, columns=cols, show="tree headings", yscrollcommand=scroll.set)
         scroll.configure(command=self.tree.yview)
 
         self.tree.heading("#0", text="Lock Hierarchy")
@@ -381,12 +405,8 @@ class LockTreePopup(ctk.CTkToplevel):
 
         self.tree.pack(fill="both", expand=True)
 
-        self.popup_menu = tk.Menu(
-            self, tearoff=0, background="#2b2b2b", foreground="white", activebackground="#D62728"
-        )
-        self.popup_menu.add_command(
-            label="💥 블로킹/대기 세션 종료 (Kill Session)", command=self.kill_lock_session
-        )
+        self.popup_menu = tk.Menu(self, tearoff=0, background="#2b2b2b", foreground="white", activebackground="#D62728")
+        self.popup_menu.add_command(label="💥 블로킹/대기 세션 종료 (Kill Session)", command=self.kill_lock_session)
         self.tree.bind("<Button-3>", self.show_lock_menu)
 
         self.load_tree(conn)
@@ -413,9 +433,7 @@ class LockTreePopup(ctk.CTkToplevel):
             messagebox.showwarning("경고", "유효한 프로세스 PID가 아닙니다.")
             return
 
-        if messagebox.askyesno(
-            "락 세션 종료", f"락 경합과 관련된 PID {pid} 세션을 강제 종료하시겠습니까?"
-        ):
+        if messagebox.askyesno("락 세션 종료", f"락 경합과 관련된 PID {pid} 세션을 강제 종료하시겠습니까?"):
             self.parent_dashboard.async_kill_session(pid)
             self.after(500, lambda: self.tree.delete(*self.tree.get_children()))
             self.after(600, lambda: self.load_tree(self.conn))
@@ -463,9 +481,7 @@ class LockTreePopup(ctk.CTkToplevel):
                 """)
                 rows = cur.fetchall()
                 if not rows:
-                    self.tree.insert(
-                        "", "end", text="✔ 락 경합 없음", values=("-", "-", "-", "-", "-")
-                    )
+                    self.tree.insert("", "end", text="✔ 락 경합 없음", values=("-", "-", "-", "-", "-"))
                     return
 
                 inserted_nodes = {}
@@ -564,6 +580,15 @@ class PostgresDashboard(ctk.CTk):
 
         threading.Thread(target=self.init_app_async, daemon=True).start()
 
+    def bring_to_focus(self):
+        """중복 실행 시 기존 창을 최상단으로 복원하고 포커스를 가져옵니다."""
+        if self.state() == "iconic":
+            self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.attributes("-topmost", False)
+        self.focus_force()
+
     def _safe_close_pyi_splash(self):
         """OS 화면 렌더링 안착 후 PyInstaller 네이티브 스플래시 파기"""
         if pyi_splash and pyi_splash.is_alive():
@@ -643,9 +668,7 @@ class PostgresDashboard(ctk.CTk):
         self.entry_db.pack(side="left", padx=4, pady=10)
         self.entry_user = ctk.CTkEntry(self.conn_frame, placeholder_text="User", width=100)
         self.entry_user.pack(side="left", padx=4, pady=10)
-        self.entry_pass = ctk.CTkEntry(
-            self.conn_frame, placeholder_text="Password", show="*", width=100
-        )
+        self.entry_pass = ctk.CTkEntry(self.conn_frame, placeholder_text="Password", show="*", width=100)
         self.entry_pass.pack(side="left", padx=4, pady=10)
 
         self.var_save_info = ctk.BooleanVar(value=False)
@@ -718,17 +741,13 @@ class PostgresDashboard(ctk.CTk):
             "Current DB Size: -\nStatus: -",
         )
         self.wal_card = self.create_status_card(self.card_frame, "WAL State", "LSN: -\nStatus: -")
-        self.lock_card = self.create_status_card(
-            self.card_frame, "ASH Alert Context", "Long Run SQL: 0\nBlockers: 0"
-        )
+        self.lock_card = self.create_status_card(self.card_frame, "ASH Alert Context", "Long Run SQL: 0\nBlockers: 0")
         self.conn_card = self.create_status_card(
             self.card_frame,
             "Connection Saturation",
             "Conn Usage: -\nMax Settings: -",
         )
-        self.rollback_card = self.create_status_card(
-            self.card_frame, "Transaction Health", "Rollback Rate: -\nStatus: -"
-        )
+        self.rollback_card = self.create_status_card(self.card_frame, "Transaction Health", "Rollback Rate: -\nStatus: -")
         self.sys_log_card = self.create_status_card(
             self.card_frame,
             "🔔 Active System Log Path",
@@ -812,9 +831,7 @@ class PostgresDashboard(ctk.CTk):
         )
         lbl_s.pack(side="left")
 
-        self.btn_lock_tree = ctk.CTkButton(
-            ctrl, text="🔒 Lock Tree", width=100, command=self.open_lock_tree
-        )
+        self.btn_lock_tree = ctk.CTkButton(ctrl, text="🔒 Lock Tree", width=100, command=self.open_lock_tree)
         self.btn_lock_tree.pack(side="right", padx=5)
 
         scroll = ctk.CTkScrollbar(self.session_container)
@@ -841,9 +858,7 @@ class PostgresDashboard(ctk.CTk):
         )
         scroll.configure(command=self.session_tree.yview)
 
-        self.session_tree.heading(
-            "pid", text="PID", anchor="center", command=lambda: self.sort_column("pid", False)
-        )
+        self.session_tree.heading("pid", text="PID", anchor="center", command=lambda: self.sort_column("pid", False))
         self.session_tree.heading(
             "usename",
             text="User",
@@ -862,9 +877,7 @@ class PostgresDashboard(ctk.CTk):
             anchor="center",
             command=lambda: self.sort_column("client_addr", False),
         )
-        self.session_tree.heading(
-            "state", text="State", anchor="center", command=lambda: self.sort_column("state", False)
-        )
+        self.session_tree.heading("state", text="State", anchor="center", command=lambda: self.sort_column("state", False))
         self.session_tree.heading(
             "duration",
             text="Duration",
@@ -994,11 +1007,7 @@ class PostgresDashboard(ctk.CTk):
                     try:
                         cur.execute("SELECT pg_current_logfile() AS current_log;")
                         log_res = cur.fetchone()
-                        self.cached_log_path = (
-                            log_res["current_log"]
-                            if log_res and log_res.get("current_log")
-                            else "Disabled"
-                        )
+                        self.cached_log_path = log_res["current_log"] if log_res and log_res.get("current_log") else "Disabled"
                     except Exception:
                         self.cached_log_path = "Disabled"
 
@@ -1143,9 +1152,7 @@ class PostgresDashboard(ctk.CTk):
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if is_manual or (self.disk_fetch_counter % 300 == 0):
                     try:
-                        cur.execute(
-                            "SELECT pg_size_pretty(pg_database_size(current_database())) as db_size;"
-                        )
+                        cur.execute("SELECT pg_size_pretty(pg_database_size(current_database())) as db_size;")
                         res_disk = cur.fetchone()
                         if res_disk:
                             self.cached_db_size = res_disk["db_size"]
@@ -1179,9 +1186,7 @@ class PostgresDashboard(ctk.CTk):
                     commits = float(res.get("commits") or 0)
                     rollbacks = float(res.get("rollbacks") or 0)
                     total_xact = commits + rollbacks
-                    data["rollback_ratio"] = (
-                        (rollbacks / total_xact * 100.0) if total_xact > 0 else 0.0
-                    )
+                    data["rollback_ratio"] = (rollbacks / total_xact * 100.0) if total_xact > 0 else 0.0
                 else:
                     data["conns"], data["hit_ratio"], data["rollback_ratio"] = (0, 100.0, 0.0)
 
@@ -1349,9 +1354,7 @@ class PostgresDashboard(ctk.CTk):
         self.disk_card.configure(text=f"Current DB Size: {data['db_size']}\nStatus: {status_str}")
 
         self.wal_card.configure(text=f"LSN: {data['wal']}\nEngine: Safe Mode Active")
-        self.lock_card.configure(
-            text=f"Long Run SQL: {data['long_queries']}\nActive Block Locks: {data['ash_lock']}"
-        )
+        self.lock_card.configure(text=f"Long Run SQL: {data['long_queries']}\nActive Block Locks: {data['ash_lock']}")
 
         conn_pct = (data["conns"] / data["max_conns"]) * 100.0 if data["max_conns"] > 0 else 0
         conn_status = "Warning!" if conn_pct > 80 else "Stable"
@@ -1365,9 +1368,7 @@ class PostgresDashboard(ctk.CTk):
         )
 
         rb_status = "Critical" if data["rollback_ratio"] > 5.0 else "Healthy"
-        self.rollback_card.configure(
-            text=f"Rollback Rate: {data['rollback_ratio']:.2f}%\nStatus: {rb_status}"
-        )
+        self.rollback_card.configure(text=f"Rollback Rate: {data['rollback_ratio']:.2f}%\nStatus: {rb_status}")
 
         sys_log_path = data.get("sys_log_path", "Disabled")
         if sys_log_path and sys_log_path != "Disabled":
@@ -1517,5 +1518,7 @@ class PostgresDashboard(ctk.CTk):
 
 
 if __name__ == "__main__":
+    ensure_single_instance()
     app = PostgresDashboard()
+    start_focus_listener(app)
     app.mainloop()
