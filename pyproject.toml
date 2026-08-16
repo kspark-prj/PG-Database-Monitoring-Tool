@@ -1,0 +1,23 @@
+[project]
+name = "pg-database-monitoring-tool"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "kspark", email = "kspark.prj@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "customtkinter>=6.0.0",
+    "matplotlib>=3.10.0",
+    "psycopg2-binary>=2.9.12",
+    "pyinstaller>=6.21.0",
+    "pymysql>=1.2.0",
+]
+
+[project.scripts]
+pg-database-monitoring-tool = "pg_database_monitoring_tool:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
